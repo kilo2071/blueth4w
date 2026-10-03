@@ -1,0 +1,10 @@
+# build artifacts and anything derived from Apple firmware (never commit these)
+.build/
+*.MSE
+*.ipsw
+*.img1
+*.otf
+Helvetica*.ttf
+*.bin
+__pycache__/
+.DS_Store

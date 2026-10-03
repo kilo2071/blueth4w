@@ -1,0 +1,169 @@
+diff --git a/untether/ipod_sun_untethered/src/img1.rs b/untether/ipod_sun_untethered/src/img1.rs
+index f090c7a..5f943e0 100644
+--- a/untether/ipod_sun_untethered/src/img1.rs
++++ b/untether/ipod_sun_untethered/src/img1.rs
+@@ -57,6 +57,7 @@ pub fn img1_parse(orig_data: &[u8], device: &Device) -> Img1 {
+     let cert = match device {
+         Device::Nano6 => Vec::new(),
+         Device::Nano7Refresh => b.to_vec(),
++        Device::Nano7_104 => b.to_vec(),
+     };
+ 
+     Img1 {
+diff --git a/untether/ipod_sun_untethered/src/main.rs b/untether/ipod_sun_untethered/src/main.rs
+index 85d39a1..72d36a4 100644
+--- a/untether/ipod_sun_untethered/src/main.rs
++++ b/untether/ipod_sun_untethered/src/main.rs
+@@ -9,7 +9,8 @@ mod payload;
+ use crate::exploit::create_cff;
+ use crate::payload::bootstrap::BootstrapPayload;
+ use crate::payload::code_exec::InitialCodeExecPayload;
+-use crate::payload::exploit_config::{ExploitConfigN6G, ExploitConfigN7G};
++use crate::payload::bt_patch::BtPatchPayload;
++use crate::payload::exploit_config::{ExploitConfigN6G, ExploitConfigN7G, ExploitConfigN7_104};
+ use anyhow::anyhow;
+ use clap::{Parser, ValueEnum};
+ use isahc::ReadResponseExt;
+@@ -42,6 +43,8 @@ fn patch_pattern_in_vec(data: &mut [u8], pattern: &[u8], new_last_byte: u8) -> O
+ pub enum Device {
+     Nano6,
+     Nano7Refresh,
++    /// iPod nano 7G on stock firmware 1.0.4 (37A40005).
++    Nano7_104,
+ }
+ 
+ /// Simple program to greet a person
+@@ -64,6 +67,11 @@ struct Args {
+     /// Write the generated raw CFF and stop before changing an MSE or IPSW.
+     #[arg(long, value_name = "PATH")]
+     cff_output: Option<PathBuf>,
++
++    /// For --device nano7-104: emit the persistent BT-fix payload (writes the RTP patch at
++    /// boot) instead of the plain SCSI code-exec stub.
++    #[arg(long)]
++    bt_patch: bool,
+ }
+ 
+ fn zip_dir<T>(src_dir: &str, target: T) -> zip::result::ZipResult<()>
+@@ -135,6 +143,18 @@ fn main() -> anyhow::Result<()> {
+         (Device::Nano7Refresh, None) => {
+             create_cff::<ExploitConfigN7G, _>(&InitialCodeExecPayload::default())?
+         }
++        (Device::Nano7_104, Some(_)) => {
++            return Err(anyhow!(
++                "the deferred/untether stage is not yet ported to 1.0.4; use the \
++                 tethered SCSI code-exec payload (omit --deferred-stage)"
++            ));
++        }
++        (Device::Nano7_104, None) if args.bt_patch => {
++            create_cff::<ExploitConfigN7_104, _>(&BtPatchPayload::default())?
++        }
++        (Device::Nano7_104, None) => {
++            create_cff::<ExploitConfigN7_104, _>(&InitialCodeExecPayload::default())?
++        }
+     };
+ 
+     if let Some(path) = &args.cff_output {
+@@ -161,7 +181,28 @@ fn main() -> anyhow::Result<()> {
+     std::fs::remove_file("./out-otf.bin")?;
+ 
+     info!("Unpacking MSE");
+-    let mut mse = if let Device::Nano6 = args.device {
++    let mut mse = if let Device::Nano7_104 = args.device {
++        // 1.0.4 (37A40005). No public IPSW download wired; the caller supplies the
++        // stock Firmware.MSE (copied here as ./Firmware-37A40005.MSE). Same rsrc
++        // parse flaw as 1.1.2: flip the sole "87402.0"+0x04 rsrc format byte to 0x03.
++        if !Path::new("./Firmware-37A40005.MSE").try_exists()? {
++            return Err(anyhow!(
++                "place the stock 1.0.4 firmware at ./Firmware-37A40005.MSE first \
++                 (e.g. cp fw/1.0.4/Firmware.MSE)"
++            ));
++        }
++        if !Path::new("./Firmware-37A40005-patched.MSE").try_exists()? {
++            let mut out = std::fs::read("./Firmware-37A40005.MSE")?;
++            let pattern: &[u8] = b"87402.0\x04";
++            if let Some(idx) = patch_pattern_in_vec(&mut out, pattern, 0x03) {
++                println!("Patched Firmware-37A40005.MSE at offset 0x{:X}", idx);
++            } else {
++                return Err(anyhow!("rsrc signature 87402.0+0x04 not found in 1.0.4 MSE"));
++            }
++            std::fs::write("./Firmware-37A40005-patched.MSE", &out)?;
++        }
++        mse::unpack("./Firmware-37A40005-patched.MSE", &args.device)
++    } else if let Device::Nano6 = args.device {
+         if !Path::new("./Firmware-36B10147.MSE").try_exists()? {
+             let mut ipsw = isahc::get("http://appldnld.apple.com/iPod/SBML/osx/bundles/041-1920.20111004.CpeEw/iPod_1.2_36B10147.ipsw")?;
+             let mut zip = ZipArchive::new(Cursor::new(ipsw.bytes().unwrap()))?;
+@@ -237,6 +278,16 @@ fn main() -> anyhow::Result<()> {
+     };
+ 
+     // Disk swap
++    if let Device::Nano7_104 = args.device {
++        // No disk swap, no IPSW: wInd3x flashes the bare MSE over DFU. Emit just that.
++        let out_path = format!("./Firmware-37A40005-{output_tag}.MSE");
++        std::fs::write(&out_path, &mse_out)?;
++        println!("Wrote repacked 1.0.4 firmware: {out_path}");
++        println!(
++            "Flash it with:  wInd3x restore --firmware {out_path}   [writes the device]"
++        );
++        return Ok(());
++    }
+     if let Device::Nano6 = args.device {
+         info!("Doing disk swap");
+         mse_out[0x5004..][..4].copy_from_slice(b"soso");
+diff --git a/untether/ipod_sun_untethered/src/mse.rs b/untether/ipod_sun_untethered/src/mse.rs
+index c122dde..aeb15f4 100644
+--- a/untether/ipod_sun_untethered/src/mse.rs
++++ b/untether/ipod_sun_untethered/src/mse.rs
+@@ -106,6 +106,7 @@ pub fn unpack(path: &str, device: &Device) -> Mse {
+         let data_len = match device {
+             Device::Nano6 => (length + 0x800) as usize,
+             Device::Nano7Refresh => length as usize,
++            Device::Nano7_104 => length as usize,
+         };
+ 
+         let section_header = &firm_data[dev_offset as usize..][..0x1000];
+diff --git a/untether/ipod_sun_untethered/src/payload/exploit_config.rs b/untether/ipod_sun_untethered/src/payload/exploit_config.rs
+index 076b477..9df2ba7 100644
+--- a/untether/ipod_sun_untethered/src/payload/exploit_config.rs
++++ b/untether/ipod_sun_untethered/src/payload/exploit_config.rs
+@@ -65,6 +65,29 @@ impl ExploitConfig for ExploitConfigN7G {
+     const BUILDCHAR_WRITE_OFFSET: u16 = 0;
+ }
+ 
++/// iPod nano 7G on stock firmware 1.0.4 (37A40005). Derived + validated against
++/// the decrypted 1.0.4 and 1.1.2 osos (see ghidra/EXPLOIT_CONSTANTS_104.md in the
++/// na-no research pack): cff_slot_load is byte-for-byte structurally identical to
++/// 1.1.2's, so every frame offset is unchanged and only the absolute addresses of
++/// cff_slot_load (-4), the CFF decoder (-4) and the overwritten SCSI handler (-4)
++/// shift; the nothrow allocator is unchanged.
++pub struct ExploitConfigN7_104;
++impl ExploitConfig for ExploitConfigN7_104 {
++    const OFFSET_BUILDCHAR_LEN_PTR: u16 = 120;
++    const OFFSET_BUILDCHAR_PTR: u16 = Self::OFFSET_BUILDCHAR_LEN_PTR - 1;
++    // 1.0.4 cff_slot_load is 0x0813a3f0 (1.1.2: 0x0813a3f4). Same frame: decoder at
++    // sp+0x2c, LR at sp+0x3a4, pivot decoder+0x11c, so OFFSET_LR is unchanged.
++    const OFFSET_LR: u16 = 151;
++    const OFFSET_CHARSTRING_PTR: u16 = 132;
++    const PUSH_COUNT: usize = 43;
++    const SWAP_COUNT: usize = 128;
++    const DROP_COUNT: usize = Self::SWAP_COUNT + 17;
++    const PATCH_MFG_STR: bool = false;
++    // 1.0.4 SCSI command handler overwritten with the RWX stub (1.1.2: 0x0819c458).
++    const BUILDCHAR_OVERWRITE_ADDR: u32 = 0x0819_c454_u32;
++    const BUILDCHAR_WRITE_OFFSET: u16 = 0;
++}
++
+ pub struct ExploitConfigN5GEmu;
+ impl ExploitConfig for ExploitConfigN5GEmu {
+     const OFFSET_BUILDCHAR_LEN_PTR: u16 = 120;
+diff --git a/untether/ipod_sun_untethered/src/payload/mod.rs b/untether/ipod_sun_untethered/src/payload/mod.rs
+index dda0bd3..9a32fbd 100644
+--- a/untether/ipod_sun_untethered/src/payload/mod.rs
++++ b/untether/ipod_sun_untethered/src/payload/mod.rs
+@@ -1,4 +1,5 @@
+ pub mod bootstrap;
++pub mod bt_patch;
+ pub mod code_exec;
+ pub mod exploit_config;
+ pub mod payload_builder;
